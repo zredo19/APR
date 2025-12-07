@@ -1,24 +1,27 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from app.database import engine, get_db
+from app.database import engine, get_db, SessionLocal
 from app import models, schemas
+from app.auth import authenticate_user, create_access_token, get_current_active_user, ACCESS_TOKEN_EXPIRE_MINUTES
 from typing import List
 from app.chatbot_engine import procesar_mensaje
 import pandas as pd
 import shutil
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY") # O pega tu clave aquí directamente si solo estás probando, pero NO es recomendable para producción.
+API_KEY = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=API_KEY)
 
-genai.configure(api_key=API_KEY)
+MODEL_NAME = "gemini-2.5-flash"
 
 INSTRUCCIONES_SISTEMA = """
 Eres el Asistente Virtual oficial de la Cooperativa de Agua APR Graneros.
@@ -36,10 +39,44 @@ REGLAS:
 - Si te preguntan algo fuera del tema del agua o la cooperativa, responde amablemente que solo puedes ayudar con temas del APR.
 - Si no sabes la respuesta, sugiere llamar al número de emergencias.
 """
-model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    system_instruction=INSTRUCCIONES_SISTEMA
-)
+
+# --- HERRAMIENTA (TOOL) PARA GEMINI ---
+def consultar_deuda_rut(rut: str):
+    """
+    Consulta la deuda total de un usuario dado su RUT.
+    Retorna un mensaje con el monto total y los periodos adeudados, o indica si no tiene deuda.
+    """
+    db = SessionLocal()
+    try:
+        # Buscar usuario
+        usuario = db.query(models.Usuario).filter(models.Usuario.rut == rut).first()
+        if not usuario:
+            return f"No encontré ningún usuario con el RUT {rut}."
+        
+        # Buscar cuentas impagas
+        cuentas_impagas = db.query(models.Cuenta).filter(
+            models.Cuenta.usuario_id == usuario.id,
+            models.Cuenta.esta_pagada == False
+        ).all()
+        
+        if not cuentas_impagas:
+            return f"El usuario {usuario.nombre_completo} no tiene deudas pendientes. ¡Está al día!"
+        
+        total_deuda = sum(c.monto for c in cuentas_impagas)
+        periodos = [c.periodo for c in cuentas_impagas]
+        
+        return f"El usuario {usuario.nombre_completo} tiene una deuda total de ${total_deuda} correspondiente a los periodos: {', '.join(periodos)}."
+        
+    except Exception as e:
+        return f"Ocurrió un error al consultar la deuda: {str(e)}"
+    finally:
+        db.close()
+
+# model = genai.GenerativeModel(
+#     model_name="gemini-2.5-flash",
+#     system_instruction=INSTRUCCIONES_SISTEMA,
+#     tools=[consultar_deuda_rut]
+# )
 
 # Crear tablas (si no existen)
 models.Base.metadata.create_all(bind=engine)
@@ -67,6 +104,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- AUTENTICACIÓN ---
+
+@app.post("/token", response_model=schemas.Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """
+    Endpoint de login que recibe username (RUT) y password.
+    Retorna un token JWT si las credenciales son correctas.
+    """
+    # El username será el RUT del usuario
+    user = authenticate_user(db, form_data.username, form_data.password)
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="RUT o contraseña incorrectos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Crear token de acceso
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.rut},
+        expires_delta=access_token_expires
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}
 
 # --- RUTAS USUARIO FINAL ---
 
@@ -167,12 +231,19 @@ def crear_cuenta(cuenta: schemas.CuentaCreate, db: Session = Depends(get_db)):
 @app.post("/chat/interactuar", response_model=RespuestaChat)
 async def interactuar(consulta: ConsultaUsuario):
     try:
-        # Aquí ocurre la magia: Enviamos el mensaje a Gemini
-        # Iniciamos un chat (puedes guardar el historial si quieres algo más avanzado, 
-        # pero para empezar, una consulta directa funciona bien).
+        # Iniciamos el chat con Function Calling automático
+        chat = client.chats.create(
+            model=MODEL_NAME,
+            config=types.GenerateContentConfig(
+                system_instruction=INSTRUCCIONES_SISTEMA,
+                tools=[consultar_deuda_rut],  # Function calling automático
+            )
+        )
         
-        response = model.generate_content(consulta.mensaje)
+        # Enviamos el mensaje del usuario
+        response = chat.send_message(consulta.mensaje)
         
+        # Obtenemos la respuesta final (texto)
         texto_respuesta = response.text
 
         # Retornamos la respuesta limpia
@@ -182,9 +253,9 @@ async def interactuar(consulta: ConsultaUsuario):
         }
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error en chat: {e}")
         return {
-            "respuesta": "Lo siento, tuve un problema interno. Intenta de nuevo.",
+            "respuesta": "Lo siento, tuve un problema interno al procesar tu solicitud. Intenta de nuevo.",
             "mensaje_usuario": consulta.mensaje
         }
 
@@ -207,7 +278,10 @@ def actualizar_feedback(interaccion_id: int, feedback: schemas.FeedbackUpdate, d
 
 # --- RUTA ADMIN: Métricas del Chatbot ---
 @app.get("/admin/metricas")
-def obtener_metricas(db: Session = Depends(get_db)):
+def obtener_metricas(
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(get_current_active_user)
+):
     """
     Endpoint para que los administradores vean métricas del chatbot:
     - Total de interacciones
@@ -264,7 +338,11 @@ def obtener_metricas(db: Session = Depends(get_db)):
 
 # --- RUTA ADMIN: CARGA MASIVA DESDE EXCEL ---
 @app.post("/admin/importar-excel")
-async def importar_excel(archivo: UploadFile = File(...), db: Session = Depends(get_db)):
+async def importar_excel(
+    archivo: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.Usuario = Depends(get_current_active_user)
+):
     """
     Endpoint para carga masiva de datos desde archivo Excel.
     
@@ -364,7 +442,6 @@ async def importar_excel(archivo: UploadFile = File(...), db: Session = Depends(
                                 fecha_venc = datetime(int(año), int(mes) + 1, 1)
                         except:
                             # Si falla el parsing, usar fecha actual + 30 días
-                            from datetime import timedelta
                             fecha_venc = datetime.now() + timedelta(days=30)
                         
                         nueva_cuenta = models.Cuenta(

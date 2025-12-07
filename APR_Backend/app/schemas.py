@@ -104,3 +104,17 @@ class SectorUpdate(BaseModel):
     mensaje_alerta: Optional[str] = None
     inicio_corte_programado: Optional[datetime] = None
     fin_corte_programado: Optional[datetime] = None
+
+# --- AUTENTICACIÓN JWT ---
+class Token(BaseModel):
+    """Respuesta del endpoint de login"""
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    """Datos decodificados del token JWT"""
+    rut: Optional[str] = None
+
+class UserInDB(UsuarioBase):
+    """Usuario con contraseña hasheada (para uso interno)"""
+    hashed_password: Optional[str] = None

@@ -25,14 +25,15 @@ class Usuario(Base):
     id = Column(Integer, primary_key=True, index=True)
     rut = Column(String, unique=True, index=True)
     nombre_completo = Column(String)
-    rol = Column(String, default="cliente") # 'cliente', 'admin', 'tecnico'
+    rol = Column(String, default="cliente") # 'cliente', 'admin', 'personal'
     direccion = Column(String)
     sector_id = Column(Integer, ForeignKey("sectores.id"))
+    hashed_password = Column(String, nullable=True)  # Solo para admin/personal
 
     sector = relationship("Sector", back_populates="usuarios")
     cuentas = relationship("Cuenta", back_populates="usuario")
     reportes = relationship("Reporte", back_populates="usuario")
-    chats = relationship("InteraccionChat", back_populates="usuario") # Nueva relación
+    chats = relationship("InteraccionChat", back_populates="usuario")
 
 class Cuenta(Base):
     __tablename__ = "cuentas"
