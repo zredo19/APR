@@ -54,18 +54,32 @@ class Cuenta(CuentaBase):
     class Config:
         from_attributes = True
 
-# --- CHAT (Nuevo) ---
+# --- CHAT (Actualizado con feedback) ---
 class ChatCreate(BaseModel):
     usuario_id: Optional[int] = None
     mensaje_usuario: str
     respuesta_bot: str
 
-class ChatLog(ChatCreate):
+class ChatResponse(BaseModel):
+    """Respuesta del chat que incluye el ID de la interacción para feedback"""
     id: int
-    fecha: datetime
+    respuesta: str
+    mensaje_usuario: str
     
     class Config:
         from_attributes = True
+
+class ChatLog(ChatCreate):
+    id: int
+    fecha: datetime
+    es_util: Optional[bool] = None
+    
+    class Config:
+        from_attributes = True
+
+class FeedbackUpdate(BaseModel):
+    """Esquema para actualizar el feedback de una interacción"""
+    es_util: bool
 
 # --- REPORTE (Cortes, Reclamos) ---
 class ReporteBase(BaseModel):
@@ -89,4 +103,4 @@ class SectorUpdate(BaseModel):
     tiene_corte: Optional[bool] = None
     mensaje_alerta: Optional[str] = None
     inicio_corte_programado: Optional[datetime] = None
-    fin_corte_programado: Optional[datetime] = None        
+    fin_corte_programado: Optional[datetime] = None
