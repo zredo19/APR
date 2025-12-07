@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware # <--- IMPORTANTE
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from app.database import engine, get_db
 from app import models, schemas
@@ -9,16 +9,55 @@ import pandas as pd
 import shutil
 from pathlib import Path
 from datetime import datetime
+import os
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
+API_KEY = os.getenv("GEMINI_API_KEY") # O pega tu clave aquí directamente si solo estás probando, pero NO es recomendable para producción.
+
+genai.configure(api_key=API_KEY)
+
+INSTRUCCIONES_SISTEMA = """
+Eres el Asistente Virtual oficial de la Cooperativa de Agua APR Graneros.
+Tu tono es amable, profesional y servicial.
+Responde de forma concisa (máximo 3 oraciones si es posible).
+
+INFORMACIÓN DE LA COOPERATIVA:
+- Horario de atención: Lunes a Viernes de 08:30 a 14:00 hrs.
+- Teléfono de emergencias: +569 9999 9999.
+- Dirección: Calle Principal 123, Graneros.
+- Cortes programados: No hay cortes programados para esta semana.
+- Cómo pagar: Se puede pagar en la oficina o por transferencia bancaria (Cuenta Rut: 12.345.678-9).
+
+REGLAS:
+- Si te preguntan algo fuera del tema del agua o la cooperativa, responde amablemente que solo puedes ayudar con temas del APR.
+- Si no sabes la respuesta, sugiere llamar al número de emergencias.
+"""
+model = genai.GenerativeModel(
+    model_name="gemini-2.5-flash",
+    system_instruction=INSTRUCCIONES_SISTEMA
+)
 
 # Crear tablas (si no existen)
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="API Cooperativa APR")
 
+# Modelos de datos (Pydantic)
+class ConsultaUsuario(BaseModel):
+    mensaje: str # Lo que escribe el usuario
+
+class RespuestaChat(BaseModel):
+    respuesta: str
+    mensaje_usuario: str # Agregamos esto para arreglar el error que tenías antes
+
 # --- CONFIGURACIÓN CORS (Crucial para React) ---
 origins = [
-    "http://localhost:3000", # Puerto por defecto de React
-    "http://localhost:5173", # Puerto por defecto de Vite (por si acaso)
+    "http://localhost:3000",  # Puerto por defecto de React
+    "http://localhost:5173",  # Puerto por defecto de Vite (por si acaso)
 ]
 
 app.add_middleware(
@@ -125,28 +164,103 @@ def crear_cuenta(cuenta: schemas.CuentaCreate, db: Session = Depends(get_db)):
     return db_cuenta
 
 # --- RUTA CHATBOT (Registro de interacciones) ---
-@app.post("/chat/interactuar")
-def interactuar_chat(datos: schemas.ChatCreate, db: Session = Depends(get_db)):
-    # 1. Buscamos el RUT si tenemos el ID de usuario (para personalizar la respuesta)
-    rut_usuario = None
-    if datos.usuario_id:
-        user = db.query(models.Usuario).filter(models.Usuario.id == datos.usuario_id).first()
-        if user:
-            rut_usuario = user.rut
+@app.post("/chat/interactuar", response_model=RespuestaChat)
+async def interactuar(consulta: ConsultaUsuario):
+    try:
+        # Aquí ocurre la magia: Enviamos el mensaje a Gemini
+        # Iniciamos un chat (puedes guardar el historial si quieres algo más avanzado, 
+        # pero para empezar, una consulta directa funciona bien).
+        
+        response = model.generate_content(consulta.mensaje)
+        
+        texto_respuesta = response.text
 
-    # 2. Generamos la respuesta con el motor de IA
-    respuesta_ia = procesar_mensaje(datos.mensaje_usuario, db, rut_usuario)
+        # Retornamos la respuesta limpia
+        return {
+            "respuesta": texto_respuesta,
+            "mensaje_usuario": consulta.mensaje
+        }
 
-    # 3. Guardamos en historial (Requisito Rúbrica)
-    interaccion = models.InteraccionChat(
-        usuario_id=datos.usuario_id,
-        mensaje_usuario=datos.mensaje_usuario,
-        respuesta_bot=respuesta_ia
-    )
-    db.add(interaccion)
+    except Exception as e:
+        print(f"Error: {e}")
+        return {
+            "respuesta": "Lo siento, tuve un problema interno. Intenta de nuevo.",
+            "mensaje_usuario": consulta.mensaje
+        }
+
+# --- RUTA FEEDBACK: Actualizar utilidad de una interacción ---
+@app.put("/chat/{interaccion_id}/feedback")
+def actualizar_feedback(interaccion_id: int, feedback: schemas.FeedbackUpdate, db: Session = Depends(get_db)):
+    """
+    Permite al usuario marcar si una respuesta del bot fue útil o no.
+    Esto ayuda a mejorar el chatbot iterativamente.
+    """
+    interaccion = db.query(models.InteraccionChat).filter(models.InteraccionChat.id == interaccion_id).first()
+    
+    if not interaccion:
+        raise HTTPException(status_code=404, detail="Interacción no encontrada")
+    
+    interaccion.es_util = feedback.es_util
     db.commit()
+    
+    return {"mensaje": "Feedback registrado exitosamente", "es_util": feedback.es_util}
 
-    return {"respuesta": respuesta_ia}
+# --- RUTA ADMIN: Métricas del Chatbot ---
+@app.get("/admin/metricas")
+def obtener_metricas(db: Session = Depends(get_db)):
+    """
+    Endpoint para que los administradores vean métricas del chatbot:
+    - Total de interacciones
+    - Tasa de éxito (% de respuestas útiles)
+    - Últimas 5 preguntas donde el bot falló
+    """
+    from sqlalchemy import func
+    
+    # 1. Total de interacciones
+    total_interacciones = db.query(models.InteraccionChat).count()
+    
+    # 2. Tasa de éxito
+    if total_interacciones > 0:
+        # Contar interacciones útiles (es_util = True)
+        interacciones_utiles = db.query(models.InteraccionChat).filter(
+            models.InteraccionChat.es_util == True
+        ).count()
+        
+        # Contar interacciones con feedback (es_util no es None)
+        interacciones_con_feedback = db.query(models.InteraccionChat).filter(
+            models.InteraccionChat.es_util.isnot(None)
+        ).count()
+        
+        # Calcular tasa de éxito sobre las que tienen feedback
+        if interacciones_con_feedback > 0:
+            tasa_exito = round((interacciones_utiles / interacciones_con_feedback) * 100, 2)
+        else:
+            tasa_exito = 0.0
+    else:
+        tasa_exito = 0.0
+        interacciones_con_feedback = 0
+    
+    # 3. Últimas 5 preguntas fallidas (es_util = False)
+    preguntas_fallidas = db.query(models.InteraccionChat).filter(
+        models.InteraccionChat.es_util == False
+    ).order_by(models.InteraccionChat.fecha.desc()).limit(5).all()
+    
+    preguntas_fallidas_list = [
+        {
+            "id": p.id,
+            "mensaje_usuario": p.mensaje_usuario,
+            "respuesta_bot": p.respuesta_bot,
+            "fecha": p.fecha.isoformat()
+        }
+        for p in preguntas_fallidas
+    ]
+    
+    return {
+        "total_interacciones": total_interacciones,
+        "interacciones_con_feedback": interacciones_con_feedback,
+        "tasa_exito": tasa_exito,
+        "preguntas_fallidas": preguntas_fallidas_list
+    }
 
 # --- RUTA ADMIN: CARGA MASIVA DESDE EXCEL ---
 @app.post("/admin/importar-excel")
