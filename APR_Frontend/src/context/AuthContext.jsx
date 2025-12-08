@@ -31,11 +31,7 @@ export const AuthProvider = ({ children }) => {
 
             const API_URL = import.meta.env.VITE_API_URL;
 
-            const response = await axios.post(`${API_URL}/token`, formData, ... {
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-            });
+            const response = await axios.post(`${API_URL}/token`, formData)
 
             const { access_token } = response.data;
 
