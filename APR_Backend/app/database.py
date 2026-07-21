@@ -14,7 +14,7 @@ if not SQLALCHEMY_DATABASE_URL:
     print("⚠️  PELIGRO: Render no encontró la variable DATABASE_URL.")
     print("⚠️  Usando configuración de 'localhost' por defecto (esto fallará en la nube).")
     # Configuración por defecto para desarrollo local (tu PC)
-    SQLALCHEMY_DATABASE_URL = "postgresql://postgres:admin@localhost/apr_db"
+    SQLALCHEMY_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/apr_db"
 else:
     print("✅  ÉXITO: Variable DATABASE_URL detectada correctamente.")
 
